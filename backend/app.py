@@ -16,29 +16,26 @@ load_dotenv()
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
-# yt-dlp fallback
-try:
-    import yt_dlp
-    YTDLP_AVAILABLE = True
-except ImportError:
-    YTDLP_AVAILABLE = False
+# yt-dlp fallback (lazy imported inside fetch_ytdlp for fast cold start)
+YTDLP_AVAILABLE = None  # resolved on first use
+
 
 app = Flask(__name__)
 CORS(app)
 
-# ===== SESSION SETUP (OPTIMIZED) =====
+# ===== SESSION SETUP =====
 session = requests.Session()
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# NOTE: no global Referer here — we set it per-request on the CDN call.
 session.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
-    "Referer": "https://www.tiktok.com/",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
 })
@@ -60,7 +57,7 @@ session.mount("http://", adapter)
 session.mount("https://", adapter)
 
 # ===== SQLITE DATABASE (WAL + THREAD LOCK) =====
-DB_PATH = "stats.db"
+DB_PATH = os.getenv("DB_PATH", "stats.db")
 db_lock = threading.Lock()
 
 conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
@@ -113,15 +110,17 @@ def db_execute(query, params=(), commit=True):
         return cur
 
 
-# ===== RAM CACHE =====
-cache = {}
-cache_lock = threading.Lock()
+# ===== IN-MEMORY URL CACHE (prevents expired-URL 403s) =====
+url_cache = {}          # video_id -> (video_url, referer, http_headers, expires_at)
+url_cache_lock = threading.Lock()
+URL_TTL = 120           # seconds — tikwm URLs generally live a few minutes
+
 
 # ===== HELPERS =====
 def clean_filename(text):
     if not text:
         text = "ToolifyX Downloader"
-    text = re.sub(r'[\\/*?:"<>|%&]', "", text)
+    text = re.sub(r'[\\/*?:"<>|%&\r\n]', "", text)
     text = re.sub(r'\s+', " ", text).strip()
     return text[:120] or "ToolifyX Downloader"
 
@@ -160,7 +159,8 @@ def fetch_tikwm(url):
                     "title": data.get("title", ""),
                     "author": (data.get("author", {}) or {}).get("nickname", "")
                               or (data.get("author", {}) or {}).get("unique_id", ""),
-                    "thumbnail": data.get("cover", "")
+                    "thumbnail": data.get("cover", ""),
+                    "http_headers": {},
                 }
     except Exception as e:
         print("tikwm err:", e)
@@ -168,7 +168,7 @@ def fetch_tikwm(url):
 
 
 def fetch_tikwm_hd(url):
-    """Same host, but requests the HD variant explicitly."""
+    """Same host, HD variant — different response shape than base call."""
     try:
         res = session.post(
             "https://www.tikwm.com/api/",
@@ -184,7 +184,8 @@ def fetch_tikwm_hd(url):
                     "title": data.get("title", ""),
                     "author": (data.get("author", {}) or {}).get("nickname", "")
                               or (data.get("author", {}) or {}).get("unique_id", ""),
-                    "thumbnail": data.get("cover", "")
+                    "thumbnail": data.get("cover", ""),
+                    "http_headers": {},
                 }
     except Exception as e:
         print("tikwm hd err:", e)
@@ -207,7 +208,8 @@ def fetch_backup(url):
                     "video_url": video_url,
                     "title": data.get("title", ""),
                     "author": data.get("author", ""),
-                    "thumbnail": data.get("thumbnail", "")
+                    "thumbnail": data.get("thumbnail", ""),
+                    "http_headers": {},
                 }
     except Exception as e:
         print("musicaldown err:", e)
@@ -216,10 +218,19 @@ def fetch_backup(url):
 
 def fetch_ytdlp(url):
     """
-    Silent fast fallback. Extracts direct video URL with no downloads,
-    minimal format probing, short socket timeout.
+    Silent fast fallback. Returns the direct URL AND the http_headers dict
+    that yt-dlp uses — those headers are the ones the CDN accepts, so we
+    forward them when streaming.
     """
-    if not YTDLP_AVAILABLE:
+    global YTDLP_AVAILABLE
+    if YTDLP_AVAILABLE is False:
+        return None
+
+    try:
+        import yt_dlp  # noqa
+        YTDLP_AVAILABLE = True
+    except ImportError:
+        YTDLP_AVAILABLE = False
         return None
 
     def _extract():
@@ -241,7 +252,6 @@ def fetch_ytdlp(url):
         if not info:
             return None
 
-        # Prefer direct URL
         video_url = info.get("url")
         if not video_url:
             for f in info.get("formats") or []:
@@ -257,11 +267,17 @@ def fetch_ytdlp(url):
         if not video_url or not video_url.startswith("http"):
             return None
 
+        # yt-dlp tells us exactly which headers the CDN wants
+        http_headers = info.get("http_headers") or {}
+        # Strip headers we don't want to blindly forward
+        http_headers.pop("Accept-Encoding", None)
+
         return {
             "video_url": video_url,
             "title": info.get("title", "") or "",
             "author": info.get("uploader", "") or info.get("creator", "") or "",
             "thumbnail": info.get("thumbnail", "") or "",
+            "http_headers": http_headers,
         }
 
     try:
@@ -277,7 +293,6 @@ def fetch_ytdlp(url):
 def fetch_tiktok_video(url):
     url = expand_url(url)
 
-    # Phase 1: race the three primary APIs — return on first success.
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     futures = [
         executor.submit(fetch_tikwm, url),
@@ -293,7 +308,6 @@ def fetch_tiktok_video(url):
                 result = None
             if result:
                 result["original_url"] = url
-                # cancel remaining work
                 for f in futures:
                     f.cancel()
                 executor.shutdown(wait=False, cancel_futures=True)
@@ -303,13 +317,38 @@ def fetch_tiktok_video(url):
 
     executor.shutdown(wait=False, cancel_futures=True)
 
-    # Phase 2: silent yt-dlp fallback
+    # Silent yt-dlp fallback
     result = fetch_ytdlp(url)
     if result:
         result["original_url"] = url
         return result
 
     return None
+
+
+# ===== FRESH-URL CACHE (main fix for expired-URL 403s) =====
+def get_fresh_video(video_id):
+    """
+    Returns (result_dict, from_cache:bool) or (None, False).
+    result_dict contains: video_url, title, author, thumbnail, http_headers, original_url
+    """
+    now = time.time()
+    with url_cache_lock:
+        cached = url_cache.get(video_id)
+        if cached and cached["expires_at"] > now:
+            return cached["result"], True
+
+    result = fetch_tiktok_video(video_id)
+    if not result:
+        return None, False
+
+    with url_cache_lock:
+        url_cache[video_id] = {
+            "result": result,
+            "expires_at": now + URL_TTL,
+        }
+
+    return result, False
 
 
 # ===== SAVE CACHE =====
@@ -328,6 +367,81 @@ def save_cache_db(url, video_url):
         print("DB thread error:", e)
 
 
+# ===== STREAM HEADER BUILDER =====
+def _build_stream_headers(video_url, referer, extra_headers, range_header=None):
+    """
+    Build headers for the CDN GET. Priority:
+      1. extra_headers from yt-dlp (authoritative for that URL)
+      2. Sensible TikTok-CDN defaults otherwise
+    """
+    h = {
+        "User-Agent": session.headers["User-Agent"],
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Merge yt-dlp's authoritative headers on top
+    if extra_headers:
+        for k, v in extra_headers.items():
+            if v:
+                h[k] = v
+
+    # Only set Referer if we don't already have one from yt-dlp
+    if "Referer" not in h and referer:
+        h["Referer"] = referer
+        h.setdefault("Origin", "https://www.tiktok.com")
+
+    if range_header:
+        h["Range"] = range_header
+
+    return h
+
+
+def _open_upstream(video_url, referer, extra_headers, range_header):
+    """
+    Try multiple header profiles until one returns < 400.
+    Returns (response, profile_name) or (None, last_status).
+    """
+    profiles = []
+
+    # 1. yt-dlp's own headers (or defaults incl. referer)
+    profiles.append(("primary", _build_stream_headers(video_url, referer, extra_headers, range_header)))
+
+    # 2. bare — no referer at all
+    profiles.append(("no-referer", _build_stream_headers(video_url, None, extra_headers, range_header)))
+
+    # 3. mobile Safari UA
+    mobile = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+            "Mobile/15E148 Safari/604.1"
+        ),
+        "Accept": "*/*",
+    }
+    if extra_headers:
+        for k, v in extra_headers.items():
+            if v:
+                mobile.setdefault(k, v)
+    if range_header:
+        mobile["Range"] = range_header
+    profiles.append(("mobile-ua", mobile))
+
+    last_status = None
+    for name, hdrs in profiles:
+        try:
+            r = session.get(video_url, stream=True, timeout=20, headers=hdrs)
+            if r.status_code < 400:
+                return r, name
+            last_status = r.status_code
+            r.close()
+        except Exception as e:
+            last_status = f"exc:{e}"
+            continue
+
+    return None, last_status
+
+
 # ===== DOWNLOAD ROUTE =====
 @app.route("/download", methods=["POST"])
 def download_video():
@@ -339,7 +453,6 @@ def download_video():
         if not url:
             return jsonify({"success": False, "message": "No URL"}), 400
 
-        # Stats update
         try:
             db_execute("UPDATE stats SET value=value+1 WHERE key='requests'")
             db_execute("INSERT OR IGNORE INTO unique_ips (ip) VALUES (?)", (ip,))
@@ -347,7 +460,7 @@ def download_video():
             print("stats err:", e)
 
         result = fetch_tiktok_video(url)
-        print("FETCH RESULT:", result)
+        print("FETCH RESULT:", {k: v for k, v in (result or {}).items() if k != "http_headers"})
 
         if not result:
             return jsonify({"success": False, "message": "Fetch failed"}), 500
@@ -358,8 +471,12 @@ def download_video():
         thumbnail = result.get("thumbnail", "")
         original_url = result.get("original_url", url)
 
-        with cache_lock:
-            cache[url] = video_url
+        # Prime the short-TTL URL cache so /file doesn't need to re-fetch
+        with url_cache_lock:
+            url_cache[url] = {
+                "result": result,
+                "expires_at": time.time() + URL_TTL,
+            }
 
         threading.Thread(
             target=save_cache_db,
@@ -397,83 +514,88 @@ def download_video():
         }), 500
 
 
-# ===== FILE SERVING (RE-FETCH FRESH URL) =====
+# ===== FILE SERVING =====
 @app.route("/file")
 def serve_file():
     video_url = request.args.get("url")
     video_id = request.args.get("videoId")
     mode = request.args.get("mode", "preview")
+    custom_filename = request.args.get("filename")
 
-    if video_id and not video_url:
-        result = fetch_tiktok_video(video_id)
-        if result:
-            video_url = result["video_url"]
-        else:
+    referer = None
+    extra_headers = {}
+
+    if not video_url and video_id:
+        cached_result, from_cache = get_fresh_video(video_id)
+        if not cached_result:
             return jsonify({
                 "success": False,
                 "message": "Could not re-fetch video. Link may be expired or invalid."
             }), 500
+        video_url = cached_result["video_url"]
+        referer = cached_result.get("original_url") or video_id
+        extra_headers = cached_result.get("http_headers") or {}
+
+        if from_cache:
+            try:
+                db_execute("UPDATE stats SET value=value+1 WHERE key='cache_hits'")
+            except Exception:
+                pass
+    elif video_id:
+        referer = video_id
 
     if not video_url:
         return jsonify({"success": False, "message": "No video URL"}), 400
 
-    try:
-        range_header = request.headers.get("Range")
+    range_header = request.headers.get("Range")
 
-        source_headers = {
-            "Referer": "https://www.tiktok.com/",
-            "User-Agent": session.headers["User-Agent"],
-            "Accept": "*/*",
-        }
-        if range_header:
-            source_headers["Range"] = range_header
+    r, profile = _open_upstream(video_url, referer, extra_headers, range_header)
+    if r is None:
+        print(f"upstream fail url={video_url[:100]} profile={profile}")
+        return jsonify({
+            "success": False,
+            "message": f"Upstream source returned {profile}"
+        }), 502
 
-        r = session.get(video_url, stream=True, timeout=15, headers=source_headers)
-
-        # Guard: never stream upstream errors as video
-        if r.status_code >= 400:
-            r.close()
-            return jsonify({
-                "success": False,
-                "message": f"Upstream source returned {r.status_code}"
-            }), 502
-
+    # Filename
+    if custom_filename:
+        custom_filename = re.sub(r'[\\/*?:"<>|\r\n]', "", custom_filename)[:120]
+        if not custom_filename.lower().endswith(".mp4"):
+            custom_filename += ".mp4"
+        ascii_filename = custom_filename
+        utf8_filename = quote(custom_filename)
+    else:
         rand = random_string()
-        base_name = "ToolifyX Downloader"
-        ascii_filename = f"{base_name}-{rand}.mp4"
-        utf8_filename = quote(f"{base_name}-{rand}.mp4")
+        ascii_filename = f"ToolifyX Downloader-{rand}.mp4"
+        utf8_filename = quote(ascii_filename)
 
-        status_code = 206 if r.status_code == 206 else 200
+    status_code = 206 if r.status_code == 206 else 200
 
-        headers = {
-            "Content-Type": r.headers.get("Content-Type", "video/mp4"),
-            "Accept-Ranges": "bytes",
-        }
+    headers = {
+        "Content-Type": r.headers.get("Content-Type", "video/mp4"),
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+    }
+    if "Content-Range" in r.headers:
+        headers["Content-Range"] = r.headers["Content-Range"]
+    if "Content-Length" in r.headers:
+        headers["Content-Length"] = r.headers["Content-Length"]
 
-        if "Content-Range" in r.headers:
-            headers["Content-Range"] = r.headers["Content-Range"]
+    disposition = "attachment" if mode == "download" else "inline"
+    headers["Content-Disposition"] = (
+        f'{disposition}; filename="{ascii_filename}"; '
+        f"filename*=UTF-8''{utf8_filename}"
+    )
 
-        if "Content-Length" in r.headers:
-            headers["Content-Length"] = r.headers["Content-Length"]
+    def generate():
+        try:
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    yield chunk
+        finally:
+            r.close()
 
-        disposition = "attachment" if mode == "download" else "inline"
-        headers["Content-Disposition"] = (
-            f"{disposition}; filename=\"{ascii_filename}\"; filename*=UTF-8''{utf8_filename}"
-        )
-
-        def generate():
-            try:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        yield chunk
-            finally:
-                r.close()
-
-        return Response(generate(), status=status_code, headers=headers)
-
-    except Exception as e:
-        print("file err:", e)
-        return jsonify({"success": False, "message": str(e)}), 500
+    return Response(generate(), status=status_code, headers=headers)
 
 
 # ===== STATS =====
@@ -511,6 +633,50 @@ def wake():
     })
 
 
+# ===== DEBUG (safe — no sensitive info, no server-side fetch of arbitrary URLs) =====
+@app.route("/debug-file")
+def debug_file():
+    """
+    Diagnose upstream 403s. Pass ?videoId=<tiktok url>.
+    Shows which header profile succeeds.
+    """
+    video_id = request.args.get("videoId")
+    if not video_id:
+        return jsonify({"error": "no videoId"}), 400
+
+    result = fetch_tiktok_video(video_id)
+    if not result:
+        return jsonify({"step": "fetch", "error": "fetch failed"}), 500
+
+    video_url = result["video_url"]
+    referer = result.get("original_url") or video_id
+    extra_headers = result.get("http_headers") or {}
+
+    attempts = []
+    for name, hdrs in [
+        ("primary", _build_stream_headers(video_url, referer, extra_headers)),
+        ("no-referer", _build_stream_headers(video_url, None, extra_headers)),
+    ]:
+        try:
+            r = session.get(video_url, stream=True, timeout=10, headers=hdrs)
+            attempts.append({
+                "profile": name,
+                "status": r.status_code,
+                "content_type": r.headers.get("Content-Type"),
+                "content_length": r.headers.get("Content-Length"),
+            })
+            r.close()
+        except Exception as e:
+            attempts.append({"profile": name, "error": str(e)})
+
+    return jsonify({
+        "video_url_host": video_url.split("/")[2] if "//" in video_url else "?",
+        "video_url_prefix": video_url[:120],
+        "had_ytdlp_headers": bool(extra_headers),
+        "attempts": attempts,
+    })
+
+
 # ===== ADMIN RESET =====
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
@@ -532,6 +698,10 @@ def reset_stats():
     db_execute("DELETE FROM unique_ips")
     db_execute("DELETE FROM download_logs")
 
+    # Clear URL cache too
+    with url_cache_lock:
+        url_cache.clear()
+
     return jsonify({"success": True})
 
 
@@ -539,6 +709,6 @@ def reset_stats():
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=5000,
+        port=int(os.getenv("PORT", 5000)),
         threaded=True
 )
