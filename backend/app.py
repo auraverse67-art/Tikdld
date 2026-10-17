@@ -29,7 +29,6 @@ except ImportError:
 
 YTDLP_AVAILABLE = None  # resolved on first use
 
-
 app = Flask(__name__)
 CORS(app)
 
@@ -374,7 +373,7 @@ def _build_stream_headers(video_url, referer, extra_headers, range_header=None):
     return h
 
 
-# ===== UPSTREAM OPENER (curl_cffi + proxy aware) =====
+# ===== UPSTREAM OPENER =====
 def _target_url(video_url):
     """Route through CDN proxy if configured."""
     if CDN_PROXY:
@@ -383,11 +382,6 @@ def _target_url(video_url):
 
 
 def _fetch_stream(url, headers, timeout=20):
-    """
-    Get a streaming response from a TikTok CDN URL.
-    Uses curl_cffi (with browser TLS fingerprint) if available,
-    otherwise falls back to requests.
-    """
     target = _target_url(url)
 
     if CURL_CFFI_AVAILABLE:
@@ -410,10 +404,6 @@ def _fetch_stream(url, headers, timeout=20):
 
 
 def _open_upstream(video_url, referer, extra_headers, range_header):
-    """
-    Try multiple header profiles until one returns < 400.
-    Returns (response, profile_name) or (None, last_status).
-    """
     profiles = [
         ("primary",    _build_stream_headers(video_url, referer, extra_headers, range_header)),
         ("no-referer", _build_stream_headers(video_url, None,    extra_headers, range_header)),
@@ -500,19 +490,22 @@ def download_video():
         except Exception as e:
             print("stats err:", e)
 
-        # ... inside @app.route("/download") ...
+        filename = clean_filename(title or "ToolifyX Downloader") + "_" + random_string() + ".mp4"
 
-filename = clean_filename(title or "ToolifyX Downloader") + "_" + random_string() + ".mp4"
+        # Wrap URL in proxy if configured
+        final_url = video_url
+        if CDN_PROXY:
+            final_url = f"{CDN_PROXY}?u={quote(video_url, safe='')}"
 
-return jsonify({
-    "success": True,
-    "url": f"{CDN_PROXY}?u={quote(video_url, safe='')}",  # <--- CHANGED THIS LINE
-    "filename": filename,
-    "title": title,
-    "author": author,
-    "thumbnail": thumbnail,
-    "videoId": url
-})
+        return jsonify({
+            "success": True,
+            "url": final_url,
+            "filename": filename,
+            "title": title,
+            "author": author,
+            "thumbnail": thumbnail,
+            "videoId": url
+        })
 
     except Exception as e:
         print("CRASH PREVENTED:", e)
@@ -522,7 +515,7 @@ return jsonify({
         }), 500
 
 
-# ===== FILE SERVING =====
+# ===== FILE SERVING (Kept for backwards compatibility / fallback) =====
 @app.route("/file")
 def serve_file():
     video_url = request.args.get("url")
@@ -635,109 +628,6 @@ def wake():
     return jsonify({"success": True, "message": "Server is awake"})
 
 
-# ===== DEBUG =====
-@app.route("/debug-file")
-def debug_file():
-    video_id = request.args.get("videoId")
-    if not video_id:
-        return jsonify({"error": "no videoId"}), 400
-
-    result = fetch_tiktok_video(video_id)
-    if not result:
-        return jsonify({"step": "fetch", "error": "fetch failed"}), 500
-
-    video_url = result["video_url"]
-    referer = result.get("original_url") or video_id
-    extra_headers = result.get("http_headers") or {}
-
-    attempts = []
-    for name, hdrs in [
-        ("primary",    _build_stream_headers(video_url, referer, extra_headers)),
-        ("no-referer", _build_stream_headers(video_url, None,    extra_headers)),
-    ]:
-        try:
-            r, engine = _fetch_stream(video_url, hdrs, timeout=15)
-            body_sample = b""
-            if r.status_code >= 400:
-                try:
-                    body_sample = b"".join(r.iter_content(128))[:200]
-                except Exception:
-                    pass
-            attempts.append({
-                "profile": name,
-                "engine": engine,
-                "status": r.status_code,
-                "content_type": r.headers.get("Content-Type"),
-                "content_length": r.headers.get("Content-Length"),
-                "body_sample": body_sample.decode("utf-8", "replace") if body_sample else None,
-            })
-            r.close()
-        except Exception as e:
-            attempts.append({"profile": name, "error": str(e)})
-
-    return jsonify({
-        "video_url_host": video_url.split("/")[2] if "//" in video_url else "?",
-        "video_url_prefix": video_url[:150],
-        "had_ytdlp_headers": bool(extra_headers),
-        "curl_cffi": CURL_CFFI_AVAILABLE,
-        "cdn_proxy_set": bool(CDN_PROXY),
-        "impersonate": CDN_IMPERSONATE,
-        "attempts": attempts,
-    })
-
-
-@app.route("/debug-fresh")
-def debug_fresh():
-    """Test if URL works IMMEDIATELY after extraction (isolates expiry issue)."""
-    video_id = request.args.get("videoId")
-    if not video_id:
-        return jsonify({"error": "no videoId"}), 400
-
-    t0 = time.time()
-    result = fetch_tiktok_video(video_id)
-    if not result:
-        return jsonify({"step": "fetch", "error": "fetch failed"}), 500
-    fetch_ms = int((time.time() - t0) * 1000)
-
-    video_url = result["video_url"]
-    referer = result.get("original_url") or video_id
-    extra_headers = result.get("http_headers") or {}
-    hdrs = _build_stream_headers(video_url, referer, extra_headers)
-
-    t1 = time.time()
-    try:
-        r, engine = _fetch_stream(video_url, hdrs, timeout=15)
-        status = r.status_code
-        ct = r.headers.get("Content-Type")
-        cl = r.headers.get("Content-Length")
-        body_sample = b""
-        if status >= 400:
-            try:
-                body_sample = b"".join(r.iter_content(128))[:200]
-            except Exception:
-                pass
-        r.close()
-    except Exception as e:
-        return jsonify({
-            "fetch_ms": fetch_ms,
-            "stream_error": str(e),
-            "video_url_prefix": video_url[:150],
-        })
-    stream_ms = int((time.time() - t1) * 1000)
-
-    return jsonify({
-        "fetch_ms": fetch_ms,
-        "stream_ms": stream_ms,
-        "engine": engine,
-        "status": status,
-        "content_type": ct,
-        "content_length": cl,
-        "body_sample": body_sample.decode("utf-8", "replace") if body_sample else None,
-        "video_url_prefix": video_url[:150],
-        "url_has_expire": "expire=" in video_url,
-    })
-
-
 # ===== ADMIN RESET =====
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
@@ -768,4 +658,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", 5000)),
         threaded=True
-                )
+)
