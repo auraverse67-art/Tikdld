@@ -8,7 +8,7 @@ import sqlite3
 import concurrent.futures
 import os
 import json
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -125,17 +125,6 @@ def clean_filename(text):
 
 def random_string(length=6):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
-
-
-def extract_tt_chain_token(url):
-    """TikTok CDN URLs embed `tk=tt_chain_token`; some edges need it as a cookie."""
-    try:
-        qs = parse_qs(urlparse(url).query)
-        if "tk" in qs and qs["tk"]:
-            return qs["tk"][0]
-    except Exception:
-        pass
-    return None
 
 
 # ===== EXPAND SHORT TIKTOK LINKS =====
@@ -379,11 +368,6 @@ def _build_stream_headers(video_url, referer, extra_headers, range_header=None):
         h["Referer"] = referer
         h.setdefault("Origin", "https://www.tiktok.com")
 
-    # TikTok signed-URL token as cookie — some edges require this
-    tk = extract_tt_chain_token(video_url)
-    if tk:
-        h["Cookie"] = f"tt_chain_token={tk}"
-
     if range_header:
         h["Range"] = range_header
 
@@ -447,9 +431,6 @@ def _open_upstream(video_url, referer, extra_headers, range_header):
         for k, v in extra_headers.items():
             if v:
                 mobile.setdefault(k, v)
-    tk = extract_tt_chain_token(video_url)
-    if tk:
-        mobile["Cookie"] = f"tt_chain_token={tk}"
     if range_header:
         mobile["Range"] = range_header
     profiles.append(("mobile-ua", mobile))
@@ -785,4 +766,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", 5000)),
         threaded=True
-    )
+                )
