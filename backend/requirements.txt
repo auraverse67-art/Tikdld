@@ -5,3 +5,4 @@ urllib3==2.2.3
 gunicorn==21.2.0
 python-dotenv==1.0.1
 yt-dlp==2024.12.13
+curl_cffi==0.7.3
