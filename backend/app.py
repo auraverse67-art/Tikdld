@@ -500,17 +500,19 @@ def download_video():
         except Exception as e:
             print("stats err:", e)
 
-        filename = clean_filename(title or "ToolifyX Downloader") + "_" + random_string() + ".mp4"
+        # ... inside @app.route("/download") ...
 
-        return jsonify({
-            "success": True,
-            "url": video_url,
-            "filename": filename,
-            "title": title,
-            "author": author,
-            "thumbnail": thumbnail,
-            "videoId": url
-        })
+filename = clean_filename(title or "ToolifyX Downloader") + "_" + random_string() + ".mp4"
+
+return jsonify({
+    "success": True,
+    "url": f"{CDN_PROXY}?u={quote(video_url, safe='')}",  # <--- CHANGED THIS LINE
+    "filename": filename,
+    "title": title,
+    "author": author,
+    "thumbnail": thumbnail,
+    "videoId": url
+})
 
     except Exception as e:
         print("CRASH PREVENTED:", e)
