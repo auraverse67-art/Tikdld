@@ -8,7 +8,7 @@ import sqlite3
 import concurrent.futures
 import os
 import json
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qs
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -16,7 +16,17 @@ load_dotenv()
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
-# yt-dlp fallback (lazy imported inside fetch_ytdlp for fast cold start)
+# curl_cffi — TLS impersonation. Optional but REQUIRED to beat TikTok's
+# TLS fingerprinting on datacenter IPs. Falls back to requests if missing.
+try:
+    from curl_cffi import requests as cffi_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    cffi_requests = None
+    CURL_CFFI_AVAILABLE = False
+    print("WARN: curl_cffi not installed — CDN streaming may 403. "
+          "Run: pip install curl_cffi")
+
 YTDLP_AVAILABLE = None  # resolved on first use
 
 
@@ -29,7 +39,6 @@ session = requests.Session()
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# NOTE: no global Referer here — we set it per-request on the CDN call.
 session.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -56,7 +65,15 @@ adapter = HTTPAdapter(
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
-# ===== SQLITE DATABASE (WAL + THREAD LOCK) =====
+# ===== CDN PROXY & IMPERSONATION CONFIG =====
+CDN_PROXY = os.getenv("CDN_PROXY")           # e.g. https://your-worker.workers.dev
+CDN_IMPERSONATE = os.getenv("CDN_IMPERSONATE", "chrome124")
+
+print(f"CDN_PROXY={'set' if CDN_PROXY else 'NOT SET'}")
+print(f"CDN_IMPERSONATE={CDN_IMPERSONATE}")
+print(f"CURL_CFFI_AVAILABLE={CURL_CFFI_AVAILABLE}")
+
+# ===== SQLITE DATABASE =====
 DB_PATH = os.getenv("DB_PATH", "stats.db")
 db_lock = threading.Lock()
 
@@ -65,29 +82,12 @@ conn.execute("PRAGMA journal_mode=WAL")
 conn.execute("PRAGMA synchronous=NORMAL")
 c = conn.cursor()
 
-c.execute('''
-CREATE TABLE IF NOT EXISTS stats (
-    key TEXT PRIMARY KEY,
-    value INTEGER
-)
-''')
-
+c.execute('''CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value INTEGER)''')
 for key in ["requests", "downloads", "cache_hits", "videos_served"]:
     c.execute("INSERT OR IGNORE INTO stats (key,value) VALUES (?,?)", (key, 0))
 
-c.execute('''
-CREATE TABLE IF NOT EXISTS unique_ips (
-    ip TEXT PRIMARY KEY
-)
-''')
-
-c.execute('''
-CREATE TABLE IF NOT EXISTS video_cache (
-    url TEXT PRIMARY KEY,
-    video_url TEXT
-)
-''')
-
+c.execute('''CREATE TABLE IF NOT EXISTS unique_ips (ip TEXT PRIMARY KEY)''')
+c.execute('''CREATE TABLE IF NOT EXISTS video_cache (url TEXT PRIMARY KEY, video_url TEXT)''')
 c.execute('''
 CREATE TABLE IF NOT EXISTS download_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,12 +96,10 @@ CREATE TABLE IF NOT EXISTS download_logs (
     timestamp INTEGER
 )
 ''')
-
 conn.commit()
 
 
 def db_execute(query, params=(), commit=True):
-    """Thread-safe DB helper."""
     with db_lock:
         cur = conn.cursor()
         cur.execute(query, params)
@@ -110,10 +108,10 @@ def db_execute(query, params=(), commit=True):
         return cur
 
 
-# ===== IN-MEMORY URL CACHE (prevents expired-URL 403s) =====
-url_cache = {}          # video_id -> (video_url, referer, http_headers, expires_at)
+# ===== IN-MEMORY URL CACHE =====
+url_cache = {}
 url_cache_lock = threading.Lock()
-URL_TTL = 120           # seconds — tikwm URLs generally live a few minutes
+URL_TTL = 60   # reduced — TikTok signed URLs often live <90s
 
 
 # ===== HELPERS =====
@@ -127,6 +125,17 @@ def clean_filename(text):
 
 def random_string(length=6):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
+
+def extract_tt_chain_token(url):
+    """TikTok CDN URLs embed `tk=tt_chain_token`; some edges need it as a cookie."""
+    try:
+        qs = parse_qs(urlparse(url).query)
+        if "tk" in qs and qs["tk"]:
+            return qs["tk"][0]
+    except Exception:
+        pass
+    return None
 
 
 # ===== EXPAND SHORT TIKTOK LINKS =====
@@ -168,7 +177,6 @@ def fetch_tikwm(url):
 
 
 def fetch_tikwm_hd(url):
-    """Same host, HD variant — different response shape than base call."""
     try:
         res = session.post(
             "https://www.tikwm.com/api/",
@@ -193,7 +201,6 @@ def fetch_tikwm_hd(url):
 
 
 def fetch_backup(url):
-    """musicaldown alternative."""
     try:
         res = session.post(
             "https://api2.musicaldown.com/v2/download",
@@ -217,11 +224,6 @@ def fetch_backup(url):
 
 
 def fetch_ytdlp(url):
-    """
-    Silent fast fallback. Returns the direct URL AND the http_headers dict
-    that yt-dlp uses — those headers are the ones the CDN accepts, so we
-    forward them when streaming.
-    """
     global YTDLP_AVAILABLE
     if YTDLP_AVAILABLE is False:
         return None
@@ -267,9 +269,7 @@ def fetch_ytdlp(url):
         if not video_url or not video_url.startswith("http"):
             return None
 
-        # yt-dlp tells us exactly which headers the CDN wants
         http_headers = info.get("http_headers") or {}
-        # Strip headers we don't want to blindly forward
         http_headers.pop("Accept-Encoding", None)
 
         return {
@@ -289,7 +289,7 @@ def fetch_ytdlp(url):
         return None
 
 
-# ===== PARALLEL FETCH (ULTRA FAST + SILENT YT-DLP FALLBACK) =====
+# ===== PARALLEL FETCH =====
 def fetch_tiktok_video(url):
     url = expand_url(url)
 
@@ -317,7 +317,6 @@ def fetch_tiktok_video(url):
 
     executor.shutdown(wait=False, cancel_futures=True)
 
-    # Silent yt-dlp fallback
     result = fetch_ytdlp(url)
     if result:
         result["original_url"] = url
@@ -326,12 +325,8 @@ def fetch_tiktok_video(url):
     return None
 
 
-# ===== FRESH-URL CACHE (main fix for expired-URL 403s) =====
+# ===== FRESH-URL CACHE =====
 def get_fresh_video(video_id):
-    """
-    Returns (result_dict, from_cache:bool) or (None, False).
-    result_dict contains: video_url, title, author, thumbnail, http_headers, original_url
-    """
     now = time.time()
     with url_cache_lock:
         cached = url_cache.get(video_id)
@@ -369,27 +364,25 @@ def save_cache_db(url, video_url):
 
 # ===== STREAM HEADER BUILDER =====
 def _build_stream_headers(video_url, referer, extra_headers, range_header=None):
-    """
-    Build headers for the CDN GET. Priority:
-      1. extra_headers from yt-dlp (authoritative for that URL)
-      2. Sensible TikTok-CDN defaults otherwise
-    """
     h = {
         "User-Agent": session.headers["User-Agent"],
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    # Merge yt-dlp's authoritative headers on top
     if extra_headers:
         for k, v in extra_headers.items():
             if v:
                 h[k] = v
 
-    # Only set Referer if we don't already have one from yt-dlp
     if "Referer" not in h and referer:
         h["Referer"] = referer
         h.setdefault("Origin", "https://www.tiktok.com")
+
+    # TikTok signed-URL token as cookie — some edges require this
+    tk = extract_tt_chain_token(video_url)
+    if tk:
+        h["Cookie"] = f"tt_chain_token={tk}"
 
     if range_header:
         h["Range"] = range_header
@@ -397,20 +390,51 @@ def _build_stream_headers(video_url, referer, extra_headers, range_header=None):
     return h
 
 
+# ===== UPSTREAM OPENER (curl_cffi + proxy aware) =====
+def _target_url(video_url):
+    """Route through CDN proxy if configured."""
+    if CDN_PROXY:
+        return f"{CDN_PROXY}?u={quote(video_url, safe='')}"
+    return video_url
+
+
+def _fetch_stream(url, headers, timeout=20):
+    """
+    Get a streaming response from a TikTok CDN URL.
+    Uses curl_cffi (with browser TLS fingerprint) if available,
+    otherwise falls back to requests.
+    """
+    target = _target_url(url)
+
+    if CURL_CFFI_AVAILABLE:
+        try:
+            r = cffi_requests.get(
+                target,
+                headers=headers,
+                impersonate=CDN_IMPERSONATE,
+                stream=True,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            return r, "curl_cffi"
+        except Exception as e:
+            print(f"curl_cffi err: {e}")
+
+    # fallback
+    r = session.get(target, stream=True, timeout=timeout, headers=headers)
+    return r, "requests"
+
+
 def _open_upstream(video_url, referer, extra_headers, range_header):
     """
     Try multiple header profiles until one returns < 400.
     Returns (response, profile_name) or (None, last_status).
     """
-    profiles = []
+    profiles = [
+        ("primary",    _build_stream_headers(video_url, referer, extra_headers, range_header)),
+        ("no-referer", _build_stream_headers(video_url, None,    extra_headers, range_header)),
+    ]
 
-    # 1. yt-dlp's own headers (or defaults incl. referer)
-    profiles.append(("primary", _build_stream_headers(video_url, referer, extra_headers, range_header)))
-
-    # 2. bare — no referer at all
-    profiles.append(("no-referer", _build_stream_headers(video_url, None, extra_headers, range_header)))
-
-    # 3. mobile Safari UA
     mobile = {
         "User-Agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -423,6 +447,9 @@ def _open_upstream(video_url, referer, extra_headers, range_header):
         for k, v in extra_headers.items():
             if v:
                 mobile.setdefault(k, v)
+    tk = extract_tt_chain_token(video_url)
+    if tk:
+        mobile["Cookie"] = f"tt_chain_token={tk}"
     if range_header:
         mobile["Range"] = range_header
     profiles.append(("mobile-ua", mobile))
@@ -430,10 +457,10 @@ def _open_upstream(video_url, referer, extra_headers, range_header):
     last_status = None
     for name, hdrs in profiles:
         try:
-            r = session.get(video_url, stream=True, timeout=20, headers=hdrs)
+            r, engine = _fetch_stream(video_url, hdrs)
             if r.status_code < 400:
-                return r, name
-            last_status = r.status_code
+                return r, f"{name}+{engine}"
+            last_status = f"{r.status_code}({name}+{engine})"
             r.close()
         except Exception as e:
             last_status = f"exc:{e}"
@@ -469,9 +496,7 @@ def download_video():
         title = result.get("title", "")
         author = result.get("author", "")
         thumbnail = result.get("thumbnail", "")
-        original_url = result.get("original_url", url)
 
-        # Prime the short-TTL URL cache so /file doesn't need to re-fetch
         with url_cache_lock:
             url_cache[url] = {
                 "result": result,
@@ -557,7 +582,6 @@ def serve_file():
             "message": f"Upstream source returned {profile}"
         }), 502
 
-    # Filename
     if custom_filename:
         custom_filename = re.sub(r'[\\/*?:"<>|\r\n]', "", custom_filename)[:120]
         if not custom_filename.lower().endswith(".mp4"):
@@ -593,7 +617,10 @@ def serve_file():
                 if chunk:
                     yield chunk
         finally:
-            r.close()
+            try:
+                r.close()
+            except Exception:
+                pass
 
     return Response(generate(), status=status_code, headers=headers)
 
@@ -605,17 +632,12 @@ def get_stats():
         cur = conn.cursor()
         cur.execute("SELECT key,value FROM stats")
         stats_data = dict(cur.fetchall())
-
         cur.execute("SELECT COUNT(*) FROM unique_ips")
         unique_ips_count = cur.fetchone()[0]
-
         cur.execute("SELECT ip,url,timestamp FROM download_logs")
         rows = cur.fetchall()
 
-    logs = [
-        {"ip": ip, "url": url, "timestamp": ts}
-        for ip, url, ts in rows
-    ]
+    logs = [{"ip": ip, "url": url, "timestamp": ts} for ip, url, ts in rows]
 
     return jsonify({
         **stats_data,
@@ -627,19 +649,12 @@ def get_stats():
 # ===== WAKE =====
 @app.route("/wake", methods=["GET"])
 def wake():
-    return jsonify({
-        "success": True,
-        "message": "Server is awake"
-    })
+    return jsonify({"success": True, "message": "Server is awake"})
 
 
-# ===== DEBUG (safe — no sensitive info, no server-side fetch of arbitrary URLs) =====
+# ===== DEBUG =====
 @app.route("/debug-file")
 def debug_file():
-    """
-    Diagnose upstream 403s. Pass ?videoId=<tiktok url>.
-    Shows which header profile succeeds.
-    """
     video_id = request.args.get("videoId")
     if not video_id:
         return jsonify({"error": "no videoId"}), 400
@@ -654,16 +669,24 @@ def debug_file():
 
     attempts = []
     for name, hdrs in [
-        ("primary", _build_stream_headers(video_url, referer, extra_headers)),
-        ("no-referer", _build_stream_headers(video_url, None, extra_headers)),
+        ("primary",    _build_stream_headers(video_url, referer, extra_headers)),
+        ("no-referer", _build_stream_headers(video_url, None,    extra_headers)),
     ]:
         try:
-            r = session.get(video_url, stream=True, timeout=10, headers=hdrs)
+            r, engine = _fetch_stream(video_url, hdrs, timeout=15)
+            body_sample = b""
+            if r.status_code >= 400:
+                try:
+                    body_sample = b"".join(r.iter_content(128))[:200]
+                except Exception:
+                    pass
             attempts.append({
                 "profile": name,
+                "engine": engine,
                 "status": r.status_code,
                 "content_type": r.headers.get("Content-Type"),
                 "content_length": r.headers.get("Content-Length"),
+                "body_sample": body_sample.decode("utf-8", "replace") if body_sample else None,
             })
             r.close()
         except Exception as e:
@@ -671,9 +694,64 @@ def debug_file():
 
     return jsonify({
         "video_url_host": video_url.split("/")[2] if "//" in video_url else "?",
-        "video_url_prefix": video_url[:120],
+        "video_url_prefix": video_url[:150],
         "had_ytdlp_headers": bool(extra_headers),
+        "curl_cffi": CURL_CFFI_AVAILABLE,
+        "cdn_proxy_set": bool(CDN_PROXY),
+        "impersonate": CDN_IMPERSONATE,
         "attempts": attempts,
+    })
+
+
+@app.route("/debug-fresh")
+def debug_fresh():
+    """Test if URL works IMMEDIATELY after extraction (isolates expiry issue)."""
+    video_id = request.args.get("videoId")
+    if not video_id:
+        return jsonify({"error": "no videoId"}), 400
+
+    t0 = time.time()
+    result = fetch_tiktok_video(video_id)
+    if not result:
+        return jsonify({"step": "fetch", "error": "fetch failed"}), 500
+    fetch_ms = int((time.time() - t0) * 1000)
+
+    video_url = result["video_url"]
+    referer = result.get("original_url") or video_id
+    extra_headers = result.get("http_headers") or {}
+    hdrs = _build_stream_headers(video_url, referer, extra_headers)
+
+    t1 = time.time()
+    try:
+        r, engine = _fetch_stream(video_url, hdrs, timeout=15)
+        status = r.status_code
+        ct = r.headers.get("Content-Type")
+        cl = r.headers.get("Content-Length")
+        body_sample = b""
+        if status >= 400:
+            try:
+                body_sample = b"".join(r.iter_content(128))[:200]
+            except Exception:
+                pass
+        r.close()
+    except Exception as e:
+        return jsonify({
+            "fetch_ms": fetch_ms,
+            "stream_error": str(e),
+            "video_url_prefix": video_url[:150],
+        })
+    stream_ms = int((time.time() - t1) * 1000)
+
+    return jsonify({
+        "fetch_ms": fetch_ms,
+        "stream_ms": stream_ms,
+        "engine": engine,
+        "status": status,
+        "content_type": ct,
+        "content_length": cl,
+        "body_sample": body_sample.decode("utf-8", "replace") if body_sample else None,
+        "video_url_prefix": video_url[:150],
+        "url_has_expire": "expire=" in video_url,
     })
 
 
@@ -687,10 +765,7 @@ def reset_stats():
     password = data.get("password")
 
     if not ADMIN_PASSWORD or password != ADMIN_PASSWORD:
-        return jsonify({
-            "success": False,
-            "message": "Wrong password"
-        }), 401
+        return jsonify({"success": False, "message": "Wrong password"}), 401
 
     for key in ["requests", "downloads", "cache_hits", "videos_served"]:
         db_execute("UPDATE stats SET value=0 WHERE key=?", (key,))
@@ -698,7 +773,6 @@ def reset_stats():
     db_execute("DELETE FROM unique_ips")
     db_execute("DELETE FROM download_logs")
 
-    # Clear URL cache too
     with url_cache_lock:
         url_cache.clear()
 
@@ -711,4 +785,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", 5000)),
         threaded=True
-)
+    )
