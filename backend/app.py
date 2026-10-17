@@ -492,14 +492,10 @@ def download_video():
 
         filename = clean_filename(title or "ToolifyX Downloader") + "_" + random_string() + ".mp4"
 
-        # Wrap URL in proxy if configured
-        final_url = video_url
-        if CDN_PROXY:
-            final_url = f"{CDN_PROXY}?u={quote(video_url, safe='')}"
-
+        # Direct URL returned to the frontend
         return jsonify({
             "success": True,
-            "url": final_url,
+            "url": video_url,  # <--- DIRECT URL!
             "filename": filename,
             "title": title,
             "author": author,
