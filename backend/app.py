@@ -178,11 +178,15 @@ def fetch_tiktok_video(url):
     return None
 
 
-# ===== SINGLE-CLICK DOWNLOAD (the whole point) =====
-@app.route("/download", methods=["POST"])
+# ===== SINGLE-CLICK DOWNLOAD (accepts GET or POST) =====
+@app.route("/download", methods=["GET", "POST"])
 def download_video():
-    data = request.get_json(silent=True) or {}
-    url = data.get("url")
+    if request.method == "GET":
+        url = request.args.get("url")
+    else:
+        data = request.get_json(silent=True) or {}
+        url = data.get("url")
+
     ip = request.remote_addr
 
     if not url:
@@ -206,7 +210,6 @@ def download_video():
     except: pass
 
     # IMMEDIATE 302 REDIRECT. Browser starts downloading NOW.
-    # No JSON, no preview, no delay, no expiry window.
     return redirect(video_url, code=302)
 
 
