@@ -12,7 +12,6 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 load_dotenv()
 
-# Added 'redirect' here for the direct download trick
 from flask import Flask, request, jsonify, Response, redirect
 from flask_cors import CORS
 
@@ -234,8 +233,6 @@ def download_video():
         return jsonify({"success": False, "message": str(e)}), 500
 
 # ===== DIRECT DOWNLOAD REDIRECT =====
-# This redirects the user's browser directly to TikTok to download the file.
-# Since it's the user's phone downloading it, TikTok allows it and the file is not corrupted.
 @app.route("/direct-download")
 def direct_download():
     target_url = request.args.get("url")
