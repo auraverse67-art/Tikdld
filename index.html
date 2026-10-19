@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TikTok Video Downloader</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      font-family: 'Poppins', sans-serif;
+      background: #f0f2f5;
+      min-height: 120vh;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 80px 8px;
+      color: #333;
+    }
+    .container {
+      background: #fff;
+      padding: 30px 25px;
+      border-radius: 20px;
+      width: 100%;
+      max-width: 500px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    h2 { text-align: center; font-weight: 600; color: #222; }
+    .input-wrapper { position: relative; }
+    input {
+      width: 100%;
+      padding: 18px 50px 18px 16px;
+      border-radius: 12px;
+      border: 1px solid #ccc;
+      font-size: 18px;
+      height: 50px;
+    }
+    input:focus { border-color: #4a90e2; outline: none; }
+    .input-icon {
+      position: absolute;
+      right: 16px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 26px;
+      color: #888;
+      cursor: pointer;
+      user-select: none;
+      transition: 0.2s;
+    }
+    button {
+      width: 100%;
+      padding: 16px;
+      border-radius: 12px;
+      border: none;
+      background: #4a90e2;
+      color: #fff;
+      font-size: 18px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: 0.3s;
+    }
+    button:hover { background: #357ab7; }
+    video {
+      width: 100%;
+      border-radius: 12px;
+      display: none;
+      margin-top: 20px;
+    }
+    .license-note {
+      text-align: center;
+      color: black;
+      font-size: 12px;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>TikTok Video Downloader</h2>
+    <div class="input-wrapper">
+      <input type="text" id="link" placeholder="Paste TikTok video link...">
+      <span class="input-icon" id="clearBtn">&times;</span>
+    </div>
+    <button id="fetchBtn">Fetch Video</button>
+    <video id="videoPlayer" controls autoplay muted></video>
+    <a id="downloadBtn" href="#" download style="display:none;">Download Video</a>
+    <div class="license-note">Licensed under <b>MIT</b> ✔</div>
+  </div>
+
+  <script>
+    const linkInput = document.getElementById("link");
+    const clearBtn = document.getElementById("clearBtn");
+    const fetchBtn = document.getElementById("fetchBtn");
+    const videoPlayer = document.getElementById("videoPlayer");
+    const downloadBtn = document.getElementById("downloadBtn");
+
+    clearBtn.addEventListener("click", () => {
+      linkInput.value = "";
+      videoPlayer.style.display = "none";
+      downloadBtn.style.display = "none";
+    });
+
+    fetchBtn.addEventListener("click", async () => {
+      const url = linkInput.value.trim();
+      if (!url) {
+        alert("Please paste a TikTok link.");
+        return;
+      }
+
+      try {
+        const res = await fetch("https://YOUR-RENDER-APP.onrender.com/download", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url })
+        });
+
+        const data = await res.json();
+        if (data.success) {
+          videoPlayer.src = data.url;
+          videoPlayer.style.display = "block";
+
+          downloadBtn.href = data.url;
+          downloadBtn.style.display = "inline-block";
+        } else {
+          alert(data.message || "Failed to fetch video.");
+        }
+      } catch (err) {
+        alert("Server error. Please try again later.");
+      }
+    });
+  </script>
+</body>
+</html>
