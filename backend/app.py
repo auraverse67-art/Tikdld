@@ -12,17 +12,18 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 load_dotenv()
 
-from flask import Flask, request, jsonify, Response
+# Added 'redirect' here for the direct download trick
+from flask import Flask, request, jsonify, Response, redirect
 from flask_cors import CORS
 
-# curl_cffi — TLS impersonation. REQUIRED to bypass TikTok's block on Render's IP.
+# curl_cffi — TLS impersonation
 try:
     from curl_cffi import requests as cffi_requests
     CURL_CFFI_AVAILABLE = True
 except ImportError:
     cffi_requests = None
     CURL_CFFI_AVAILABLE = False
-    print("WARN: curl_cffi not installed — CDN streaming may 403.")
+    print("WARN: curl_cffi not installed.")
 
 YTDLP_AVAILABLE = None
 
@@ -31,16 +32,11 @@ CORS(app)
 
 # ===== SESSION SETUP =====
 session = requests.Session()
-
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "*/*",
 })
 
@@ -197,7 +193,7 @@ def fetch_tiktok_video(url):
         return result
     return None
 
-# ===== DOWNLOAD ROUTE (Returns Metadata Only) =====
+# ===== DOWNLOAD ROUTE (Returns Direct URL) =====
 @app.route("/download", methods=["POST"])
 def download_video():
     try:
@@ -237,39 +233,16 @@ def download_video():
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
-# ===== FORCE DOWNLOAD ROUTE (Bypasses all blocks) =====
-@app.route("/force-download")
-def force_download():
+# ===== DIRECT DOWNLOAD REDIRECT =====
+# This redirects the user's browser directly to TikTok to download the file.
+# Since it's the user's phone downloading it, TikTok allows it and the file is not corrupted.
+@app.route("/direct-download")
+def direct_download():
     target_url = request.args.get("url")
-    filename = request.args.get("filename", "video.mp4")
     if not target_url: return "Missing URL", 400
 
-    filename = re.sub(r'[\\/*?:"<>|\r\n]', "", filename)
-
-    # Build headers to bypass TikTok's block
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Referer": "https://www.tiktok.com/"
-    }
-
-    def generate():
-        try:
-            if CURL_CFFI_AVAILABLE:
-                # Use curl_cffi to impersonate a real browser so TikTok allows it
-                r = cffi_requests.get(target_url, headers=headers, impersonate="chrome", stream=True, timeout=20)
-            else:
-                r = session.get(target_url, headers=headers, stream=True, timeout=20)
-
-            for chunk in r.iter_content(chunk_size=65536):
-                if chunk: yield chunk
-        except Exception as e:
-            print("Stream error:", e)
-
-    return Response(generate(), headers={
-        "Content-Type": "video/mp4",
-        "Content-Disposition": f'attachment; filename="{filename}"'
-    })
+    # 302 Redirect forces the browser to follow the link and download from the source (TikTok)
+    return redirect(target_url, code=302)
 
 @app.route("/wake", methods=["GET"])
 def wake():
